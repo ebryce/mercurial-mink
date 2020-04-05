@@ -59,20 +59,65 @@ class Agent:
             self.balance -= order.size
         return order
 
+    def generate_an_order(self):
+        return None
+
+    def bearish(self, urgency=1, conviction=1):
+        order = Order(side='S', size=size, price=price)
+        return order
+
+    def bullish(self, urgency=1, conviction=1):
+        order = Order(side='B', size=size, price=price)
+        return order
+
 
 class SeekerAgent(Agent):
     def __init__(self):
         return None
+
+    def generate_an_order(self):
+        return None
+
+    def thesis(self):
+        order = Order(side=side, size=size, price=price)
+        return order
 
 
 class ProviderAgent(Agent):
     def __init__(self):
         return None
 
+    def risk_on(self, side=None):
+        if side is None:
+            side = 'B' if self.balance < 0 else 'S'
+
+        if side == 'B':
+            return self.bullish()
+        else:
+            return self.bearish()
+
+        return None
+
+    def risk_off(self, urgency=1):
+        if self.balance == 0:
+            return None
+
+        side = 'B' if self.balance < 0 else 'S'
+        size = self.balance
+
+        order = Order(side=side, size=size, price=price)
+        return order
+
+    def generate_an_order(self):
+        return None
+
 
 class RetailAgent(Agent):
     # Produces nice, un-correlated order flow
     def __init__(self):
+        return None
+
+    def generate_an_order(self):
         return None
 
 
