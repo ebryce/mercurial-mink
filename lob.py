@@ -1,49 +1,76 @@
 import numpy as np
 import pandas as pd
 import math
+import logging
 
+logging.basicConfig(level=logging.DEBUG)
 
 class Market:
     def __init__(self, randomize_environment=False):
         self.lob = LOB()
         self.agents = [ProviderAgent()]
-        self._randomize_book(n_orders=15)
+
+        if randomize_environment:
+            self._randomize_book(n_orders=15)
 
     def evolve(self):
+        '''Evolves the market by one time step by having each agent submit an order and then evolving the order book'''
         for agent in self.agents:
             order = agent.evolve(self)
             if order is not None:
                 prints = self.lob.send(order)
             agent._purge()
+        return prints
 
-    def create_an_order(self, agent):
-        new_order = agent.create_an_order()
-
-    def _randomize_book(self, mid=10, spread=0.05, bid_skew=0.5, n_orders=10, depth=5):
-        for i in range(n_orders):
+    def _randomize_book(self, fair_value=10, bid_skew=0.5, n_orders=10, max_depth=5, min_spread=0.05):
+        logging.info('Randomizing the order book with {} orders around {:,.2f}; spread {:.2f}-{:.2f}'.format(
+            n_orders, fair_value, min_spread, min_spread+2*max_depth*self.lob.tick_sz)
+        )
+        
+        for _ in range(n_orders):
             order = self._random_order(
-                mid=mid, spread=spread, bid_skew=bid_skew,
-                depth=depth, marketable=False)
+                fair_value=fair_value, bid_skew=bid_skew,min_spread=min_spread,
+                max_depth=max_depth, marketable=False)
             self.lob.send(order)
 
-    def _random_order(self, mid=10, side=None, price=None, size=None, spread=0.05,
-                      bid_skew=0.5, marketable_skew=0.5, depth=5, marketable=None):
+    def _random_order(self, fair_value=None, side=None, price=None, size=None, min_spread=0.05,
+                      bid_skew=0.5, marketable_skew=0.5, max_depth=5, marketable=None):
+        
+        fair_value = self.lob.get_mid() if fair_value is None else fair_value
 
         if side is None:
             side = 'B' if np.random.rand() < bid_skew else 'S'
 
         if size is None:
-            size = np.random.randint(1, depth) * self.lob.lot_sz
+            size = np.random.randint(1, max_depth) * self.lob.lot_sz
 
         if price is None:
             if marketable is None:
                 marketable = np.random.rand() < marketable_skew
 
-            price_offset_direction = (-1 if side ==
-                                      'B' else 1) * (-1 if marketable else 1)
+            if marketable:
+                # If the order is marketable, simply cross the spread
+                logging.debug('Order to {} is marketable; crossing the spread at ${:.2f}'.format(side, self.lob.get_bid() if side=='B' else self.lob.get_offer()))
+                price = self.lob.get_offer() if side=='B' else self.lob.get_bid()
+            else:
+                # If the order is non-marketabe, price it randomly near the quote
+                if side=='B':
+                    if np.isnan(self.lob.get_bid()):
+                        logging.debug('No bid available, pricing at fair value {:.2f} minus half the minimum spread {:.2f}'.format(fair_value, min_spread))
+                        price = fair_value - min_spread*0.5
+                    else:
+                        price = self.lob.get_bid() - self.lob.tick_sz*2*max_depth*np.random.rand()
+                else:
+                    if np.isnan(self.lob.get_offer()):
+                        logging.debug('No offer available, pricing at fair value {:.2f} plus half the minimum spread {:.2f}'.format(fair_value, min_spread))
+                        price = fair_value + min_spread*0.5
+                    else:
+                        price = self.lob.get_offer() + self.lob.tick_sz*2*max_depth*np.random.rand()
 
-            price_offset = np.random.rand() * price_offset_direction
-            price = round((mid + price_offset) * 100) / 100
+        # Round the price to the nearest tick
+        price = round(price/self.lob.tick_sz)*self.lob.tick_sz
+        
+        logging.info('Creating a random {} order for {:,.0f} shares at ${:,.2f}'.format(side, size, price))
 
         order = Order(side=side, size=size, price=price, marketable=marketable)
         return order
@@ -86,8 +113,11 @@ class Agent:
         return order
 
 
-class SeekerAgent(Agent):
-    def __init__(self):
+class TakerAgent(Agent):
+    '''A trader who generally takes liquidity and is willing to pay the spread; they may or may not be informed'''
+
+    def __init__(self, information=0.5):
+        '''Information- the probability that the agent is informed'''
         Agent.__init__(self)
         return None
 
@@ -100,6 +130,7 @@ class SeekerAgent(Agent):
 
 
 class ProviderAgent(Agent):
+    '''A market maker who posts bids and offers with the intent of earning a spread'''
     def __init__(self):
         Agent.__init__(self)
         return None
@@ -139,15 +170,9 @@ class ProviderAgent(Agent):
         order = Order(side=side, size=size, marketable=True)
         return order
 
-
-class RetailAgent(Agent):
-    # Produces nice, un-correlated order flow
-    def __init__(self, agent):
-        Agent.__init__(self, agent)
-
-
 class Order:
     def __init__(self, side, size, price=None, marketable=False):
+        '''Create a new order'''
         self.side = side
         self.size = size
         self.limit = price
@@ -159,6 +184,7 @@ class Order:
         return None
 
     def give_fill(self, size, price):
+        '''Gives a fill to the order, reducing its size remaining and increasing its notional traded'''
         self.notional_traded += size * price
         self.size_filled += size
         self.size_remaining = self.size - self.size_filled
@@ -166,6 +192,7 @@ class Order:
 
 class LOB:
     def __init__(self):
+        '''Initiaize an empty limit order book'''
         self.offers = {}
         self.bids = {}
         self.prints = []
@@ -176,6 +203,7 @@ class LOB:
         return None
 
     def _purge(self):
+        '''Remove all filled orders from the book to avoid memory accumulating'''
         for level in self.offers:
             for order in self.offers[level]:
                 if order.size_remaining == 0:
@@ -191,26 +219,30 @@ class LOB:
                 self.bids.remove(level)
 
     def get_bid(self):
+        '''Return the best bid on the marketplace'''
         bid_levels = [o for o in self.bids if len(self.bids[o]) > 0]
         try:
             return np.min(bid_levels)
         except:
-            return 0
+            return np.nan
 
     def get_offer(self):
+        '''Return the best offer on the marketplace'''
         offer_levels = [o for o in self.offers if len(self.offers[o]) > 0]
         try:
             return np.max(offer_levels)
         except:
-            return 999
+            return np.nan
 
     def get_far(self, order):
+        '''Get the far price for a given order'''
         if order.side == 'B':
             return self.get_offer()
         else:
             return self.get_bid()
 
     def _check_marketable(self, order):
+        '''Check if an order is marketable'''
         if (order.side == 'B') and (order.limit >= self.get_offer()):
             order.marketable = True
         elif (order.side == 'S') and (order.limit <= self.get_bid()):
@@ -218,10 +250,11 @@ class LOB:
         return order.marketable
 
     def get_mid(self):
+        ''' Return the midprice'''
         return 0.5 * (self.get_bid() + self.get_offer())
 
     def get_level_2_book(self):
-
+        '''Return the entire limit order book'''
         bids = pd.Series(data=[np.sum([o.size for o in self.bids[p]]) for p in self.bids],
                          index=self.bids, name='bids').to_frame().T
 
@@ -234,6 +267,7 @@ class LOB:
         return lvls
 
     def send(self, order):
+        '''Add an order to the limit order book'''
         # Check marketability
         if order.marketable == True:
             order.limit = self.get_far(order)
@@ -257,8 +291,8 @@ class LOB:
         if price not in self.offers:
             self.offers[price] = []
 
-    # Add this order to the limit order book
     def _add(self, order):
+        '''Add this order to the limit order book'''
         if order.side == 'B':
             self._init_bid_level(order.limit)
             self.bids[order.limit].append(order)
@@ -267,11 +301,10 @@ class LOB:
             self.offers[order.limit].append(order)
         else:
             raise Exception('Not a valid adding order')
-        # print('Added {}{}@{:.2f}'.format(order.side, order.size, order.price))
         return []
 
-    # Match an aggressing order against several resting orders
     def _match(self, aggressing_order, resting_orders):
+        '''Match an aggressing order against several resting orders'''
         trade_prints = []
         for resting_order in resting_orders:
             fill_size = min(aggressing_order.size_remaining,
@@ -294,6 +327,7 @@ class LOB:
 
     # Print a trade
     def _print(self, aggressing_order, resting_order, price, size):
+        '''Create a trade between a resting and aggressive order and print it to the tape'''
         if size <= 0:
             return None
 
@@ -301,8 +335,6 @@ class LOB:
         resting_order.give_fill(price=price, size=size)
 
         self.prints.append({'price': price, 'size': size})
-        # print('Removed {}@{:.2f} by {}'.format(
-        #    size, price, aggressing_order.side))
 
         # If this resting order should be taken off the book
         if resting_order.size_remaining <= 0:
@@ -313,8 +345,8 @@ class LOB:
 
         return [price, size]
 
-    # An agressing order
     def _take(self, order):
+        ''' An aggressing order removes liquidity from the book'''
         contra_orders = []
         if order.side == 'B':
             # Find the prices this order could trade at
