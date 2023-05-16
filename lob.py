@@ -3,15 +3,20 @@ import pandas as pd
 import math
 import logging
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.error)
 
 class Market:
     def __init__(self, randomize_environment=False):
         self.lob = LOB()
         self.agents = [ProviderAgent()]
+        self.fv_process = FairValueProcess()
 
         if randomize_environment:
             self._randomize_book(n_orders=15)
+
+    def place_an_order(self, order, lob, agent):
+        trades = lob.send(order)
+        agent.book_an_order(order)
 
     def evolve(self):
         '''Evolves the market by one time step by having each agent submit an order and then evolving the order book'''
@@ -20,9 +25,12 @@ class Market:
             if order is not None:
                 trades = self.lob.send(order)
             agent._purge()
+        self.fv_process.evolve()
         return trades
 
-    def _randomize_book(self, fair_value=10, bid_skew=0.5, n_orders=10, max_depth=5, min_spread=0.05):
+    def _randomize_book(self, bid_skew=0.5, n_orders=10, max_depth=5, min_spread=0.05):
+        
+        fair_value = self.fv_process.fv
         logging.info('Randomizing the order book with {} orders around {:,.2f}; spread {:.2f}-{:.2f}'.format(
             n_orders, fair_value, min_spread, min_spread+2*max_depth*self.lob.tick_sz)
         )
@@ -40,7 +48,7 @@ class Market:
     def _random_order(self, fair_value=None, side=None, price=None, size=None, min_spread=0.05,
                       bid_skew=0.5, marketable_skew=0.5, max_depth=5, marketable=None):
         
-        fair_value = self.lob.get_mid() if fair_value is None else fair_value
+        fair_value = self.fv_process.fv if fair_value is None else fair_value
 
         if side is None:
             side = 'B' if np.random.rand() < bid_skew else 'S'
@@ -76,12 +84,19 @@ class Market:
         order = Order(side=side, size=size, price=price, marketable=marketable)
         return order
 
+class FairValueProcess:
+    def __init__(self, drift=0, variance=1, initial_state=10):
+        self.μ, self.σ = drift, variance
+        self.fv = initial_state
+        return None
+    
+    def evolve(self):
+        self.fv = self.fv + self.μ + self.σ*np.random.randn()
+        return self.fv
 
 class Agent:
     def __init__(self):
         self.orders = []
-        self.balance = 0
-        self.risk_threshold = 10000
         return None
 
     def _purge(self, aggressive=False):
@@ -89,12 +104,8 @@ class Agent:
             if (order.size_remaining == 0) or aggressive:
                 self.orders.remove(order)
 
-    def book_an_order(self, order, market):
+    def book_an_order(self, order):
         self.orders.append(order)
-        if order.size == 'B':
-            self.balance += order.size
-        else:
-            self.balance -= order.size
         return order
 
     def evolve(self, market):
@@ -186,9 +197,13 @@ class Order:
 
     def give_fill(self, size, price):
         '''Gives a fill to the order, reducing its size remaining and increasing its notional traded'''
-        self.notional_traded += size * price
-        self.size_filled += size
-        self.size_remaining = self.size - self.size_filled
+        if size>self.size_remaining:
+            logging.warning('Fill {} would exceed remaining order size {}'.format(size, self.size_remaining))
+            size = min(size, self.size_remaining)
+        
+        self.notional_traded = self.notional_traded + size * price
+        self.size_filled = self.size_filled + size
+        self.size_remaining = max(0,self.size - self.size_filled)
 
 
 class LOB:
@@ -255,7 +270,7 @@ class LOB:
             side = 'B' if price<=self.get_bid() else 'S' if price>=self.get_offer() else None
 
         if (price>self.get_bid()) and (price<self.get_offer()):
-            logging.warn('Depth is zero when price {:,.2f} is between bid {:,.2f} and offer {:,.2f}'.format(price, self.get_bid(), self.get_offer()))
+            logging.info('Depth is zero when price {:,.2f} is between bid {:,.2f} and offer {:,.2f}'.format(price, self.get_bid(), self.get_offer()))
             return 0
 
         if side=='B':
@@ -320,6 +335,10 @@ class LOB:
     def send(self, order):
         '''Add an order to the limit order book'''
 
+        if order.size_remaining < 0:
+            logging.info('Size remaining {} must be positive'.format(order.size_remaining))
+            return []
+
         # if not math.isclose(order.limit%self.tick_sz, 0):
         #     raise Exception('Order price {} must be a multiple of tick size {}'.format(order.limit, self.tick_sz))
 
@@ -366,15 +385,15 @@ class LOB:
         '''Match an aggressing order against several resting orders'''
         trades = []
         for resting_order in resting_orders:
-            fill_size = min(aggressing_order.size_remaining, resting_order.size_remaining)
+            fill_size = max(0,min(aggressing_order.size_remaining, resting_order.size_remaining))
             fill_price = resting_order.limit
 
             if fill_size <= 0:
-                logging.error('Fill at ${:,.2f} is not possible ({} demanded against {})'.format(fill_price, aggressing_order.size_remaining, resting_order.size_remaining))
+                logging.info('Fill at ${:,.2f} is not possible ({} demanded against {})'.format(fill_price, aggressing_order.size_remaining, resting_order.size_remaining))
                 continue
 
             if (fill_price < aggressing_order.limit and aggressing_order.size=='S') or (fill_price > aggressing_order.limit and aggressing_order.size=='B'):
-                logging.error('Aggressing {} order would fill {} shares at worse price than limit (px={:,.2f}, limit={:,.2f})'.format(aggressing_order.side, fill_size, fill_price, aggressing_order.limit))
+                logging.info('Aggressing {} order would fill {} shares at worse price than limit (px={:,.2f}, limit={:,.2f})'.format(aggressing_order.side, fill_size, fill_price, aggressing_order.limit))
 
             trade = self._print(aggressing_order=aggressing_order, resting_order=resting_order, price=fill_price, size=fill_size)
             trades.append(trade)
