@@ -7,16 +7,16 @@ logging.basicConfig(level=logging.error)
 
 class Market:
     def __init__(self, randomize_environment=False):
-        self.lob = LOB()
-        self.agents = [ProviderAgent()]
-        self.fv_process = FairValueProcess()
+
+        self.lob = LOB(asset=Asset())
+        self.agents = [MarketMaker()]
 
         if randomize_environment:
             self._randomize_book(n_orders=15)
 
     def place_an_order(self, order, lob, agent):
         trades = lob.send(order)
-        agent.book_an_order(order)
+        agent.book_an_order(order, trades)
 
     def evolve(self):
         '''Evolves the market by one time step by having each agent submit an order and then evolving the order book'''
@@ -84,19 +84,38 @@ class Market:
         order = Order(side=side, size=size, price=price, marketable=marketable)
         return order
 
-class FairValueProcess:
+class Asset:
+    '''Describes the movement of the fair value of the risky asset; looks a bit like Kyle (1985)'''
+
     def __init__(self, drift=0, variance=1, initial_state=10):
         self.μ, self.σ = drift, variance
-        self.fv = initial_state
+        self.F = initial_state # The final payoff of the risky asset
+        self.midpoint = initial_state
         return None
     
     def evolve(self):
-        self.fv = self.fv + self.μ + self.σ*np.random.randn()
-        return self.fv
+        ''' The fair value of the risky asset follows a martingale process '''
+        self.F = self.F + self.σ*np.random.randn()
+        return self.F
+    
+    def _get_prediction(self, σ_η):
+        ''' Return the prediction of the fair value of the risky asset '''
+        η = np.random.normal(0, σ_η) # The noise in the prediction
+        s = self.F + η               # A signal based on the noisy view of FV
+        return s
+    
+    def get_forecast(self, σ_η):
+        ''' Return the forecast of the fair value of the risky asset 
+        E[F|s] = m + β (s - m)'''
+        β = self.σ**2 / (self.σ**2 - σ_η**2)
+        EF = self.midpoint + β*(self._get_prediction(σ_η) - self.midpoint)
+        return EF
 
 class Agent:
-    def __init__(self):
+    def __init__(self, noise=None):
+        ''' An agent that can interact with the market '''
         self.orders = []
+        self.σ_η = noise
         return None
 
     def _purge(self, aggressive=False):
@@ -104,28 +123,23 @@ class Agent:
             if (order.size_remaining == 0) or aggressive:
                 self.orders.remove(order)
 
-    def book_an_order(self, order):
+    def book_an_order(self, order, trades):
         self.orders.append(order)
         return order
+    
+    def determine_fv(self, asset):
+        ''' Determine the agent's view of the fair value of the risky asset '''
+        return asset.get_forecast(self.σ_η)
 
     def evolve(self, market):
         if self.balance < self.risk_threshold:
             order = self.generate_an_order(market=market)
-            self.book_an_order(order=order, market=market)
+            self.book_an_order(order=order)
         else:
             self._purge(aggressive=True)
         return order
 
-    def bearish(self, size=100, price=None):
-        order = Order(side='S', size=size, price=price)
-        return order
-
-    def bullish(self, size=100, price=None):
-        order = Order(side='B', size=size, price=price)
-        return order
-
-
-class TakerAgent(Agent):
+class LiquidityTrader(Agent):
     '''A trader who generally takes liquidity and is willing to pay the spread; they may or may not be informed'''
 
     def __init__(self, information=0.5):
@@ -133,54 +147,16 @@ class TakerAgent(Agent):
         Agent.__init__(self)
         return None
 
-    def generate_an_order(self, market):
-        if market.lob.get_mid() > 10.20:
-            return self.bearish(size=1000, price=market.lob.get_bid())
-        elif market.lob.get_mid() < 9.80:
-            return self.bullish(size=1000, price=market.lob.get_offer())
-        return None
-
-
-class ProviderAgent(Agent):
-    '''A market maker who posts bids and offers with the intent of earning a spread'''
+class InformedTrader(Agent):
+    '''A trader who possesses some information about the fair value of the asset'''
     def __init__(self):
-        Agent.__init__(self)
         return None
 
-    def generate_an_order(self, market):
-        if abs(self.balance) < 10000:
-            side = 'S' if market.lob.get_mid() > 10 else 'B'
-            price = market.lob.get_bid() if side == 'B' else market.lob.get_offer()
-            if market.lob.get_mid() > 10.20:
-                side = 'S'
-                price = 10.20
-            elif market.lob.get_mid() < 9.80:
-                side = 'B'
-                price = 9.80
-
-            order = self.risk_on(side=side, price=price)
-        else:
-            order = self.risk_off()
-
-        return order
-
-    def risk_on(self, side=None, size=1000, price=None):
-        if side == 'B':
-            return self.bullish(size=size, price=price)
-        else:
-            return self.bearish(size=size, price=price)
-
+class MarketMaker(Agent):
+    '''A market maker who posts bids and offers with the intent of earning a spread
+    Will later start to look a bit like Stoll (1978) and Grossman & Miller (1988)'''
+    def __init__(self):
         return None
-
-    def risk_off(self, urgency=1):
-        if self.balance == 0:
-            return None
-
-        side = 'B' if self.balance < 0 else 'S'
-        size = (self.balance / 10)
-
-        order = Order(side=side, size=size, marketable=True)
-        return order
 
 class Order:
     def __init__(self, side, size, price=None, marketable=False):
@@ -207,11 +183,12 @@ class Order:
 
 
 class LOB:
-    def __init__(self):
+    def __init__(self, asset):
         '''Initiaize an empty limit order book'''
         self.offers = {}
         self.bids = {}
         self.prints = []
+        self.asset = asset
 
         self.tick_sz = 0.01
         self.lot_sz = 100
@@ -356,6 +333,8 @@ class LOB:
             trades.extend(self._add(order))
 
         order.prints.extend(trades)
+
+        self.asset.midpoint = self.get_mid() # Update the asset's ex ante fair value
 
         return trades
 
